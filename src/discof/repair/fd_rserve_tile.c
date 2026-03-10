@@ -8,6 +8,7 @@
 #include "../../disco/keyguard/fd_keyguard.h"
 #include "../../disco/keyguard/fd_keyload.h"
 #include "../../disco/keyguard/fd_keyswitch.h"
+#include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../disco/shred/fd_shred_tile.h"
 #include "../../disco/store/fd_shredb.h"
@@ -28,6 +29,15 @@
 
 /* 10 minutes in milliseconds. */
 #define FD_RSERVE_SIGNED_REPAIR_WINDOW (60L*10L*1000L)
+
+/* static map from request type to metric array index */
+static uint metric_index[FD_REPAIR_KIND_ORPHAN + 1] = {
+  [FD_REPAIR_KIND_PING]          = FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_PING_IDX,
+  [FD_REPAIR_KIND_SHRED]         = FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_WINDOW_IDX,
+  [FD_REPAIR_KIND_HIGHEST_SHRED] = FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_HIGHEST_WINDOW_IDX,
+  [FD_REPAIR_KIND_ORPHAN]        = FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_ORPHAN_IDX,
+};
+
 
 typedef union {
   struct {
@@ -64,6 +74,24 @@ typedef struct ctx {
 
   fd_ip4_udp_hdrs_t serve_hdr[1];
   ushort            net_id;
+
+  struct {
+    ulong send_pkt_cnt;
+    ulong sent_pkt_types  [FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_CNT];
+    ulong missed_pkt_types[FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_CNT];
+
+    ulong shreds_current;
+    ulong disk_allocated_bytes;
+
+    ulong ping_cache_entries;
+    ulong ping_cache_evictions;
+    ulong fail_sigverify_request;
+    ulong fail_own_key;
+    ulong fail_not_for_us;
+    ulong fail_invalid_token;
+    ulong fail_outdated;
+    ulong fail_invalid_shred_idx;
+  } metrics[ 1 ];
 } ctx_t;
 
 FD_FN_CONST static inline ulong
@@ -89,6 +117,7 @@ send_packet( ctx_t               * ctx,
             uchar const          * payload,
             ulong                  payload_sz,
             ulong                  tsorig ) {
+  ctx->metrics->send_pkt_cnt++;
   uchar * packet = fd_chunk_to_laddr( ctx->net_out_mem, ctx->net_out_chunk );
   fd_ip4_udp_hdrs_t * hdr = (fd_ip4_udp_hdrs_t *)packet;
   *hdr = *ctx->serve_hdr;
@@ -125,17 +154,20 @@ handle_pong( ctx_t              * ctx,
 
   if( FD_UNLIKELY( fd_pubkey_eq( &ctx->identity_public_key, &request->from ) ) ) {
     /* We've received our own repair request, ignore. */
+    ctx->metrics->fail_own_key++;
     return;
   }
 
   if( FD_UNLIKELY( FD_ED25519_SUCCESS!=fd_ed25519_verify( request->hash.uc, 32UL, request->sig, request->from.uc, ctx->sha512 ) ) ) {
     /* Invalid signature, ignore. */
+    ctx->metrics->fail_sigverify_request++;
     return;
   }
 
   /* Verify that the pong hash corresponds to either our current or
      previous rotating token.  This prevents replayed or stale pongs. */
   if( FD_UNLIKELY( !fd_rserve_pong_token_verify( ctx->rserve, request->hash.uc ) ) ) {
+    ctx->metrics->fail_invalid_token++;
     return;
   }
 
@@ -149,6 +181,7 @@ handle_pong( ctx_t              * ctx,
       ping_map_ele_remove_fast( rserve->ping_map, victim, rserve->ping_pool );
       ping_pool_ele_release( rserve->ping_pool, victim );
       ctx->metrics->ping_cache_entries--;
+      ctx->metrics->ping_cache_evictions++;
     }
     entry = ping_pool_ele_acquire( rserve->ping_pool );
     entry->addr = request->from;
@@ -198,10 +231,12 @@ handle_net_request( ctx_t             * ctx,
 
   if( FD_UNLIKELY( !fd_pubkey_eq( &ctx->identity_public_key, &header->to ) ) ) {
     /* The message wasn't intended for us, ignore. */
+    ctx->metrics->fail_not_for_us++;
     return;
   }
   if( FD_UNLIKELY( fd_pubkey_eq( &ctx->identity_public_key, &header->from ) ) ) {
     /* We've received our own repair request, ignore. */
+    ctx->metrics->fail_own_key++;
     return;
   }
 
@@ -210,6 +245,7 @@ handle_net_request( ctx_t             * ctx,
   if( FD_UNLIKELY( ts_diff < 0L ) ) ts_diff = -ts_diff;
   if( FD_UNLIKELY( ts_diff > FD_RSERVE_SIGNED_REPAIR_WINDOW ) ) {
     /* The message timestamp is too far from the current time, ignore. */
+    ctx->metrics->fail_outdated++;
     return;
   }
 
@@ -224,6 +260,7 @@ handle_net_request( ctx_t             * ctx,
 
   if( FD_UNLIKELY( FD_ED25519_SUCCESS!=fd_ed25519_verify( signable, signable_sz, header->sig, header->from.uc, ctx->sha512 ) ) ) {
     /* Invalid signature, ignore. */
+    ctx->metrics->fail_sigverify_request++;
     return;
   }
 
@@ -241,6 +278,7 @@ handle_net_request( ctx_t             * ctx,
 
         if( FD_UNLIKELY( (shred_idx & fd_ulong_mask( 15, 64 ))!=0 ) ) {
           /* If the shred_idx does not fit into 15-bits, reject it. */
+          ctx->metrics->fail_invalid_shred_idx++;
           return;
         }
 
@@ -252,12 +290,14 @@ handle_net_request( ctx_t             * ctx,
           len = fd_shredb_query_highest( ctx->shredb, slot, (uint)shred_idx, payload );
         }
         if( FD_UNLIKELY( len<0 ) ) {
-          /* FD_LOG_DEBUG(( "didn't have shreds for (slot=%lu, shred_idx=%lu)", slot, shred_idx )); */
+          FD_LOG_DEBUG(( "didn't have shreds for (slot=%lu, shred_idx=%lu)", slot, shred_idx ));
+          ctx->metrics->missed_pkt_types[ metric_index[tag] ]++;
           return;
         }
 
         fd_memcpy( payload+len, &header->nonce, sizeof(uint) );
         send_packet( ctx, stem, ip4->saddr, udp->net_sport, ip4->daddr, payload, (ulong)len+sizeof(uint), fd_frag_meta_ts_comp( fd_tickcount() ) );
+        ctx->metrics->sent_pkt_types[ metric_index[tag] ]++;
         return;
       }
       case FD_REPAIR_KIND_ORPHAN: {
@@ -275,11 +315,13 @@ handle_net_request( ctx_t             * ctx,
           int len = fd_shredb_query_highest( ctx->shredb, current, 0, payload );
           if( FD_UNLIKELY( len<0 ) ) {
             FD_LOG_DEBUG(("didn't have orphan shreds for (slot=%lu, root=%lu)", current, msg->slot ));
+            ctx->metrics->missed_pkt_types[ FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_ORPHAN_IDX ]++;
             return;
           }
           fd_shred_t const * shred = (fd_shred_t const *)fd_type_pun_const( payload );
           memcpy( payload+len, &header->nonce, sizeof(uint) );
           send_packet( ctx, stem, ip4->saddr, udp->net_sport, ip4->daddr, payload, (ulong)len+sizeof(uint), fd_frag_meta_ts_comp( fd_tickcount() ) );
+          ctx->metrics->sent_pkt_types[ FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_ORPHAN_IDX ]++;
           ushort parent_off = shred->data.parent_off;
           /* fd_shred_parse ensures that parent_off will be 0 if and only if slot is 0 */
           if( FD_UNLIKELY( parent_off==0 ) ) break;
@@ -304,6 +346,7 @@ handle_net_request( ctx_t             * ctx,
 
     /* Send the ping packet back to the source. */
     send_packet( ctx, stem, ip4->saddr, udp->net_sport, ip4->daddr, (uchar const *)fd_type_pun_const( msg ), sizeof(fd_repair_ping_t), fd_frag_meta_ts_comp( fd_tickcount() ) );
+    ctx->metrics->sent_pkt_types[ FD_METRICS_ENUM_RSERVE_SENT_RESPONSE_TYPES_V_PING_IDX ]++;
   }
 }
 
@@ -324,6 +367,7 @@ handle_shred( ctx_t             * ctx,
   if( FD_UNLIKELY( !(fd_shred_type( shred->variant ) & FD_SHRED_TYPEMASK_DATA) ) ) return;
 
   fd_shredb_insert( ctx->shredb, shred, fd_shred_sz( shred ) );
+  ctx->metrics->shreds_current = ctx->shredb->cnt;
 }
 
 static inline int
@@ -401,7 +445,30 @@ during_housekeeping( ctx_t * ctx ) {
     ping_dlist_ele_pop_head( rserve->ping_dlist, rserve->ping_pool );
     ping_map_ele_remove_fast( rserve->ping_map, head, rserve->ping_pool );
     ping_pool_ele_release( rserve->ping_pool, head );
+    ctx->metrics->ping_cache_entries--;
   }
+}
+
+static inline void
+metrics_write( ctx_t * ctx ) {
+  FD_MCNT_SET( RSERVE, TOTAL_PKT_COUNT,              ctx->metrics->send_pkt_cnt );
+  FD_MCNT_ENUM_COPY( RSERVE, SENT_RESPONSE_TYPES,    ctx->metrics->sent_pkt_types );
+  FD_MCNT_ENUM_COPY( RSERVE, MISSED_RESPONSE_TYPES,  ctx->metrics->missed_pkt_types );
+
+  FD_MGAUGE_SET( RSERVE, SHREDS_CURRENT, ctx->metrics->shreds_current );
+  /* SHREDS_MAX doesn't change and is set in init() */
+  FD_MGAUGE_SET( RSERVE, DISK_CURRENT_BYTES, ctx->metrics->shreds_current*sizeof(fd_shredb_entry_t) );
+  FD_MGAUGE_SET( RSERVE, DISK_ALLOCATED_BYTES, ctx->shredb->file_shreds*sizeof(fd_shredb_entry_t) );
+
+  FD_MCNT_SET( RSERVE, PING_CACHE_ENTRIES,   ctx->metrics->ping_cache_entries );
+  FD_MCNT_SET( RSERVE, PING_CACHE_EVICTIONS, ctx->metrics->ping_cache_evictions );
+
+  FD_MCNT_SET( RSERVE, FAILED_SIGVERIFY,           ctx->metrics->fail_sigverify_request );
+  FD_MCNT_SET( RSERVE, FAILED_OWN_KEY,             ctx->metrics->fail_own_key );
+  FD_MCNT_SET( RSERVE, FAILED_INVALID_TOKEN,       ctx->metrics->fail_invalid_token );
+  FD_MCNT_SET( RSERVE, FAILED_OUTDATED,            ctx->metrics->fail_outdated );
+  FD_MCNT_SET( RSERVE, FAILED_NOT_FOR_US,          ctx->metrics->fail_not_for_us );
+  FD_MCNT_SET( RSERVE, FAILED_INVALID_SHRED_INDEX, ctx->metrics->fail_invalid_shred_idx );
 }
 
 static void
@@ -441,6 +508,9 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->rserve    = fd_rserve_join   ( fd_rserve_new( ctx->rserve, ping_cache_entries, ctx->seed ) );
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
   FD_TEST( ctx->keyswitch );
+
+  fd_memset( ctx->metrics, 0, sizeof(ctx->metrics) );
+  FD_MGAUGE_SET( RSERVE, SHREDS_MAX, ctx->shredb->max_shreds );
 
   ctx->halt_signing = 0;
   ctx->net_id = (ushort)0;
@@ -535,6 +605,7 @@ populate_allowed_fds( fd_topo_t const *      topo FD_PARAM_UNUSED,
 #define STEM_CALLBACK_CONTEXT_TYPE  ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(ctx_t)
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
+#define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_RETURNABLE_FRAG     returnable_frag
 
 #include "../../disco/stem/fd_stem.c"
