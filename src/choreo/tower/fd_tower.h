@@ -452,6 +452,7 @@ struct fd_tower_blk {
   int       leader;             /* whether this slot was our own leader slot */
   int       propagated;         /* whether this slot has been propagation confirmed (1/3 stake) */
   ulong     prev_leader_slot;   /* previous slot in which we were leader as of this slot (inclusive) */
+  ulong     bank_idx;           /* index into fd_banks for the bank that replayed this slot */
 };
 typedef struct fd_tower_blk fd_tower_blk_t;
 

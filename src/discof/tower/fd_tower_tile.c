@@ -195,6 +195,27 @@ typedef struct auth_vtr auth_vtr_t;
 
 #define AUTH_VOTERS_MAX (16UL)
 
+struct epoch_voter {
+  fd_pubkey_t vote_acc;         /* vote account address (map key) */
+  ulong       prev;             /* for map_chain */
+  ulong       next;             /* for map_chain / pool */
+  ulong       stake;            /* stake associated with the voter */
+  fd_pubkey_t authorized_voter; /* authorized voter pubkey */
+};
+typedef struct epoch_voter epoch_voter_t;
+
+#define MAP_NAME               epoch_voter_map
+#define MAP_ELE_T              epoch_voter_t
+#define MAP_KEY_T              fd_pubkey_t
+#define MAP_KEY                vote_acc
+#define MAP_KEY_EQ(k0,k1)      (!memcmp((k0),(k1),sizeof(fd_pubkey_t)))
+#define MAP_KEY_HASH(key,seed) fd_ulong_hash((key)->ul[1]^(seed))
+#include "../../util/tmpl/fd_map_chain.c"
+
+#define POOL_NAME epoch_voter_pool
+#define POOL_T    epoch_voter_t
+#include "../../util/tmpl/fd_pool.c"
+
 struct in_ctx {
   int         mcache_only;
   fd_wksp_t * mem;
@@ -231,12 +252,18 @@ struct fd_tower_tile {
   ulong             scratch_root;  /* scratch root for processing */
 
   publish_t *                publishes; /* deque of slot_confirmed msgs queued for publishing */
-  fd_multi_epoch_leaders_t * mleaders; /* multi-epoch leaders */
+  fd_multi_epoch_leaders_t * mleaders;  /* multi-epoch leaders */
 
   /* borrowed joins */
 
   fd_banks_t *    banks;
   fd_accdb_user_t accdb[1];
+
+  ulong               root_epoch;
+  epoch_voter_map_t * curr_epoch_voters_map;
+  epoch_voter_t *     curr_epoch_voters_pool;
+  epoch_voter_map_t * next_epoch_voters_map;
+  epoch_voter_t *     next_epoch_voters_pool;
 
   /* static structures */
 
@@ -532,7 +559,7 @@ publish_slot_confirmed( fd_tower_tile_t * ctx,
        confirmation (ie. we haven't replayed the block yet). */
 
     if( FD_UNLIKELY( !ghost_blk ) ) {
-      if( fd_uchar_extract_bit( votes_blk->flags, i+4 ) ) continue; /* already forward confirmed */
+      if( FD_UNLIKELY( fd_uchar_extract_bit( votes_blk->flags, i+4 ) ) ) continue; /* already forward confirmed */
       votes_blk->flags = fd_uchar_set_bit( votes_blk->flags, i+4 );
       publishes_push_head( ctx->publishes, (publish_t){ .sig = FD_TOWER_SIG_SLOT_CONFIRMED, .msg = { .slot_confirmed = (fd_tower_slot_confirmed_t){ .level = levels[i], .fwd = 1, .slot = votes_blk->key.slot, .block_id = votes_blk->key.block_id } } } );
 
@@ -635,7 +662,7 @@ publish_slot_done( fd_tower_tile_t *            ctx,
   int         found_authority = deser_auth_vtr( ctx, slot_completed->epoch, found, authority, &authority_idx );
   if( FD_LIKELY( found_authority ) ) {
     msg->has_vote_txn = 1;
-    fd_txn_p_t          txn[1];
+    fd_txn_p_t txn[1];
     fd_tower_to_vote_txn( ctx->tower, &slot_completed->bank_hash, &slot_completed->block_id, &slot_completed->block_hash, ctx->identity_key, authority, ctx->vote_account, txn );
     FD_TEST( !fd_tower_vote_empty( fd_tower_votes( ctx->tower ) ) );
     FD_TEST( txn->payload_sz && txn->payload_sz<=FD_TPU_MTU );
@@ -694,6 +721,90 @@ publish_slot_rooted( fd_tower_tile_t * ctx,
 }
 
 static void
+clear_epoch_voters( epoch_voter_map_t ** map,
+                    epoch_voter_t **     pool,
+                    ulong                seed ) {
+  ulong pool_max  = epoch_voter_pool_max( *pool );
+  ulong chain_cnt = epoch_voter_map_chain_cnt( *map );
+  *pool = epoch_voter_pool_join( epoch_voter_pool_new( epoch_voter_pool_delete( epoch_voter_pool_leave( *pool ) ), pool_max ) );
+  *map  = epoch_voter_map_join ( epoch_voter_map_new ( epoch_voter_map_delete ( epoch_voter_map_leave ( *map  ) ), chain_cnt, seed ) );
+}
+
+static void
+populate_epoch_voters( fd_tower_tile_t *      ctx,
+                       epoch_voter_map_t *    map,
+                       epoch_voter_t *        pool,
+                       ulong                  slot,
+                       ulong                  epoch,
+                       ulong                  bank_idx,
+                       fd_top_votes_t const * top_votes ) {
+  fd_pubkey_t zero_pubkey;
+  memset( &zero_pubkey, 0, sizeof(fd_pubkey_t) );
+
+  uchar iter_mem[ FD_TOP_VOTES_ITER_FOOTPRINT ] __attribute__((aligned(FD_TOP_VOTES_ITER_ALIGN)));
+  for( fd_top_votes_iter_t * iter = fd_top_votes_iter_init( top_votes, iter_mem );
+                                   !fd_top_votes_iter_done( top_votes, iter );
+                                    fd_top_votes_iter_next( top_votes, iter ) ) {
+    fd_pubkey_t vote_acc;
+    ulong       stake;
+    if( FD_UNLIKELY( !fd_top_votes_iter_ele( top_votes, iter, &vote_acc, NULL, &stake, NULL, NULL, NULL ) ) ) continue;
+    if( FD_UNLIKELY( !epoch_voter_pool_free( pool ) ) ) break;
+    epoch_voter_t * epoch_voter   = epoch_voter_pool_ele_acquire( pool );
+    epoch_voter->vote_acc         = vote_acc;
+    epoch_voter->stake            = stake;
+    epoch_voter->authorized_voter = zero_pubkey;
+    epoch_voter_map_ele_insert( map, epoch_voter, pool );
+  }
+
+  fd_accdb_ro_pipe_t ro_pipe[1];
+  fd_funk_txn_xid_t  xid = { .ul = { slot, bank_idx } };
+  fd_accdb_ro_pipe_init( ro_pipe, ctx->accdb, &xid );
+
+  for( fd_top_votes_iter_t * iter = fd_top_votes_iter_init( top_votes, iter_mem );
+                                   !fd_top_votes_iter_done( top_votes, iter );
+                                    fd_top_votes_iter_next( top_votes, iter ) ) {
+    fd_pubkey_t vote_acc;
+    if( FD_UNLIKELY( !fd_top_votes_iter_ele( top_votes, iter, &vote_acc, NULL, NULL, NULL, NULL, NULL ) ) ) continue;
+    fd_accdb_ro_pipe_enqueue( ro_pipe, vote_acc.key );
+  }
+  fd_accdb_ro_pipe_flush( ro_pipe );
+
+  fd_accdb_ro_t * ro;
+  while( FD_LIKELY( ro = fd_accdb_ro_pipe_poll( ro_pipe ) ) ) {
+    fd_pubkey_t const * vote_acc = fd_accdb_ref_address( ro );
+    if( FD_UNLIKELY( !fd_accdb_ref_lamports( ro ) ) ) continue;
+    if( FD_UNLIKELY( !fd_vsv_is_correct_size_owner_and_init( ro->meta ) ) ) continue;
+
+    epoch_voter_t * ev = epoch_voter_map_ele_query( map, vote_acc, NULL, pool );
+    if( FD_UNLIKELY( !ev ) ) continue;
+
+    uchar const *                 data      = fd_accdb_ref_data_const( ro );
+    ulong                         auth_cnt  = fd_vote_acc_authorized_voter_cnt( data );
+    fd_authorized_voter_t const * auth_vtrs = fd_vote_acc_authorized_voters( data );
+    for( ulong i = 0; i < auth_cnt; i++ ) {
+      if( FD_LIKELY( auth_vtrs[auth_cnt - i].epoch <= epoch ) ) {
+        ev->authorized_voter = auth_vtrs[i].pubkey;
+        break;
+      }
+    }
+  }
+  fd_accdb_ro_pipe_fini( ro_pipe );
+}
+
+static void
+update_epoch_voters( fd_tower_tile_t *   ctx,
+                     ulong               slot,
+                     ulong               epoch,
+                     ulong               bank_idx,
+                     fd_bank_t const *   bank ) {
+  ctx->root_epoch = epoch;
+  clear_epoch_voters( &ctx->curr_epoch_voters_map, &ctx->curr_epoch_voters_pool, ctx->seed );
+  clear_epoch_voters( &ctx->next_epoch_voters_map, &ctx->next_epoch_voters_pool, ctx->seed );
+  populate_epoch_voters( ctx, ctx->curr_epoch_voters_map, ctx->curr_epoch_voters_pool, slot, epoch,   bank_idx, fd_bank_top_votes_t_2_query( bank ) );
+  populate_epoch_voters( ctx, ctx->next_epoch_voters_map, ctx->next_epoch_voters_pool, slot, epoch+1, bank_idx, fd_bank_top_votes_t_1_query( bank ) );
+}
+
+static void
 count_vote_acc( fd_tower_tile_t *            ctx,
                 fd_replay_slot_completed_t * slot_completed,
                 fd_ghost_blk_t *             ghost_blk,
@@ -721,13 +832,17 @@ count_vote_acc( fd_tower_tile_t *            ctx,
       FD_LOG_CRIT(( "missing ancestor. replay slot %lu vote slot %lu voter %s", slot_completed->slot, vote_slot, vote_acc_cstr ));
     }
 
+    /* Agave uses the stakes as computed on the heaviest bank's epoch.
+       It is guaranteed the heaviest bank's epoch is within 1 epoch of
+       the current root bank's epoch. */
+
     int ghost_err = fd_ghost_count_vote( ctx->ghost, ancestor_blk, vote_acc, stake, vote_slot );
     update_metrics_ghost( ctx, ghost_err );
   }
 
   FD_TEST( !fd_vote_account_node_pubkey( data, data_sz, &ctx->id_keys[ctx->vtr_cnt] ) );
-  ctx->vote_accs [ctx->vtr_cnt] = *vote_acc;
-  ctx->stakes    [ctx->vtr_cnt] = stake;
+  ctx->vote_accs[ctx->vtr_cnt] = *vote_acc;
+  ctx->stakes   [ctx->vtr_cnt] = stake;
   ctx->vtr_cnt++;
 }
 
@@ -815,8 +930,8 @@ count_vote_txn( fd_tower_tile_t * ctx,
      https://github.com/anza-xyz/agave/blob/v2.3.7/core/src/cluster_info_vote_listener.rs#L476-L487 */
 
   fd_tower_vote_t const * their_last_vote = fd_tower_vote_peek_tail_const( ctx->scratch_votes );
-  fd_hash_t const *       their_block_id  = &ctx->compact_tower_sync_serde.block_id;
-  fd_hash_t const *       their_bank_hash = &ctx->compact_tower_sync_serde.hash;
+  fd_hash_t       const * their_block_id  = &ctx->compact_tower_sync_serde.block_id;
+  fd_hash_t       const * their_bank_hash = &ctx->compact_tower_sync_serde.hash;
 
   /* Return early if their last vote is too old. */
 
@@ -828,10 +943,9 @@ count_vote_txn( fd_tower_tile_t * ctx,
      we are counting or when we observe the vote).  They default stake
      to 0 for voters who are not found. */
 
-  /* FIXME use vote slot not root slot */
-
-  ulong their_stake = fd_tower_stakes_query_stake( ctx->tower, vote_acc, fd_tower_root( ctx->tower ) );
-  if( FD_UNLIKELY( their_stake==ULONG_MAX ) ) return; /* voter is not staked in current root's epoch */
+  epoch_voter_t const * ev = epoch_voter_map_ele_query_const( ctx->curr_epoch_voters_map, vote_acc, NULL, ctx->curr_epoch_voters_pool );
+  if( FD_UNLIKELY( !ev ) ) return;
+  ulong their_stake = ev->stake;
   ulong total_stake = fd_ghost_root( ctx->ghost )->total_stake;
 
   int hfork_err = fd_hfork_count_vote( ctx->hfork, vote_acc, their_block_id, their_bank_hash, their_last_vote->slot, their_stake, total_stake );
@@ -1051,6 +1165,8 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
     tower_blk->block_id          = slot_completed->block_id;
     tower_blk->parent_block_id   = slot_completed->parent_block_id;
     tower_blk->epoch             = slot_completed->epoch;
+    tower_blk->bank_idx          = slot_completed->bank_idx;
+    /* slot_completed->epoch is already stored in tower_blk->epoch */
     tower_blk->voted             = 0;
     tower_blk->confirmed         = 0;
     tower_blk->leader            = slot_completed->is_leader;
@@ -1125,6 +1241,11 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
     fd_eqvoc_update_voters( ctx->eqvoc, ctx->id_keys, ctx->vtr_cnt );
     fd_hfork_update_voters( ctx->hfork, ctx->vote_accs, ctx->vtr_cnt );
     fd_votes_update_voters( ctx->votes, ctx->vote_accs, ctx->stakes, ctx->vtr_cnt );
+    if( FD_LIKELY( ctx->banks ) ) {
+      fd_bank_t * init_bank = fd_banks_bank_query( ctx->banks, slot_completed->bank_idx );
+      FD_TEST( init_bank );
+      update_epoch_voters( ctx, slot_completed->slot, slot_completed->epoch, slot_completed->bank_idx, init_bank );
+    }
     ctx->init              = 1;
     ctx->metrics.init_slot = slot_completed->slot;
   }
@@ -1181,6 +1302,12 @@ replay_slot_completed( fd_tower_tile_t *            ctx,
       fd_eqvoc_update_voters( ctx->eqvoc, ctx->id_keys,                ctx->vtr_cnt );
       fd_hfork_update_voters( ctx->hfork, ctx->vote_accs,              ctx->vtr_cnt );
       fd_votes_update_voters( ctx->votes, ctx->vote_accs, ctx->stakes, ctx->vtr_cnt );
+
+      if( FD_LIKELY( ctx->banks ) ) {
+        fd_bank_t * root_bank = fd_banks_bank_query( ctx->banks, newr_tower_blk->bank_idx );
+        FD_TEST( root_bank );
+        update_epoch_voters( ctx, newr_tower_blk->slot, newr_tower_blk->epoch, newr_tower_blk->bank_idx, root_bank );
+      }
     }
     fd_votes_publish( ctx->votes, root_slot );
 
@@ -1253,27 +1380,34 @@ init_choreo( void * scratch,
   ulong pub_max  = slot_max * FD_TOWER_SLOT_CONFIRMED_LEVEL_CNT;
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_tower_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_tower_tile_t), sizeof(fd_tower_tile_t)                                       );
-  void  * auth_vtr      = FD_SCRATCH_ALLOC_APPEND( l, auth_vtr_align(),         auth_vtr_footprint()                                          );
-  void  * eqvoc         = FD_SCRATCH_ALLOC_APPEND( l, fd_eqvoc_align(),         fd_eqvoc_footprint( slot_max, fec_max, PER_VTR_MAX, VTR_MAX ) );
-  void  * ghost         = FD_SCRATCH_ALLOC_APPEND( l, fd_ghost_align(),         fd_ghost_footprint( blk_max, VTR_MAX )                        );
-  void  * hfork         = FD_SCRATCH_ALLOC_APPEND( l, fd_hfork_align(),         fd_hfork_footprint( PER_VTR_MAX, VTR_MAX )                    );
-  void  * votes         = FD_SCRATCH_ALLOC_APPEND( l, fd_votes_align(),         fd_votes_footprint( slot_max, VTR_MAX )                       );
-  void  * tower         = FD_SCRATCH_ALLOC_APPEND( l, fd_tower_align(),         fd_tower_footprint( slot_max, VTR_MAX )                       );
-  void  * scratch_votes = FD_SCRATCH_ALLOC_APPEND( l, fd_tower_vote_align(),    fd_tower_vote_footprint()                                     );
-  void  * publishes     = FD_SCRATCH_ALLOC_APPEND( l, publishes_align(),        publishes_footprint( pub_max )                                );
-  void  * mleaders_mem  = FD_SCRATCH_ALLOC_APPEND( l, fd_multi_epoch_leaders_align(), fd_multi_epoch_leaders_footprint()                       );
+  fd_tower_tile_t * ctx          = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_tower_tile_t),       sizeof(fd_tower_tile_t)                                              );
+  void  * auth_vtr               = FD_SCRATCH_ALLOC_APPEND( l, auth_vtr_align(),               auth_vtr_footprint()                                                 );
+  void  * eqvoc                  = FD_SCRATCH_ALLOC_APPEND( l, fd_eqvoc_align(),               fd_eqvoc_footprint( slot_max, fec_max, PER_VTR_MAX, VTR_MAX )        );
+  void  * ghost                  = FD_SCRATCH_ALLOC_APPEND( l, fd_ghost_align(),               fd_ghost_footprint( blk_max, VTR_MAX )                               );
+  void  * hfork                  = FD_SCRATCH_ALLOC_APPEND( l, fd_hfork_align(),               fd_hfork_footprint( PER_VTR_MAX, VTR_MAX )                           );
+  void  * votes                  = FD_SCRATCH_ALLOC_APPEND( l, fd_votes_align(),               fd_votes_footprint( slot_max, VTR_MAX )                              );
+  void  * tower                  = FD_SCRATCH_ALLOC_APPEND( l, fd_tower_align(),               fd_tower_footprint( slot_max, VTR_MAX )                              );
+  void  * scratch_votes          = FD_SCRATCH_ALLOC_APPEND( l, fd_tower_vote_align(),          fd_tower_vote_footprint()                                            );
+  void  * publishes              = FD_SCRATCH_ALLOC_APPEND( l, publishes_align(),              publishes_footprint( pub_max )                                       );
+  void  * mleaders               = FD_SCRATCH_ALLOC_APPEND( l, fd_multi_epoch_leaders_align(), fd_multi_epoch_leaders_footprint()                                   );
+  void  * curr_epoch_voters_pool = FD_SCRATCH_ALLOC_APPEND( l, epoch_voter_pool_align(),       epoch_voter_pool_footprint( fd_ulong_pow2_up( VTR_MAX ) )            );
+  void  * curr_epoch_voters_map  = FD_SCRATCH_ALLOC_APPEND( l, epoch_voter_map_align(),        epoch_voter_map_footprint ( epoch_voter_map_chain_cnt_est( VTR_MAX ) )                    );
+  void  * next_epoch_voters_pool = FD_SCRATCH_ALLOC_APPEND( l, epoch_voter_pool_align(),       epoch_voter_pool_footprint( fd_ulong_pow2_up( VTR_MAX ) )            );
+  void  * next_epoch_voters_map  = FD_SCRATCH_ALLOC_APPEND( l, epoch_voter_map_align(),        epoch_voter_map_footprint ( epoch_voter_map_chain_cnt_est( VTR_MAX ) )                    );
   FD_SCRATCH_ALLOC_FINI( l, scratch_align );
   (void)auth_vtr; /* privileged_init */
-  ctx->eqvoc              = fd_eqvoc_join              ( fd_eqvoc_new              ( eqvoc, slot_max, fec_max, PER_VTR_MAX, VTR_MAX, ctx->seed ) );
-  ctx->ghost              = fd_ghost_join              ( fd_ghost_new              ( ghost, blk_max, VTR_MAX, ctx->seed )                        );
-  ctx->hfork              = fd_hfork_join              ( fd_hfork_new              ( hfork, PER_VTR_MAX, VTR_MAX, ctx->seed )                    );
-  ctx->votes              = fd_votes_join              ( fd_votes_new              ( votes, slot_max, VTR_MAX, ctx->seed )                       );
-  ctx->tower              = fd_tower_join              ( fd_tower_new              ( tower, slot_max, VTR_MAX, ctx->seed )                       );
-  ctx->scratch_votes      = fd_tower_vote_join         ( fd_tower_vote_new         ( scratch_votes )                                             );
-  ctx->publishes          = publishes_join             ( publishes_new             ( publishes, pub_max )                                        );
-  ctx->mleaders           = fd_multi_epoch_leaders_join( fd_multi_epoch_leaders_new( mleaders_mem )                                               );
-
+  ctx->eqvoc                  = fd_eqvoc_join              ( fd_eqvoc_new              ( eqvoc, slot_max, fec_max, PER_VTR_MAX, VTR_MAX, ctx->seed )                   );
+  ctx->ghost                  = fd_ghost_join              ( fd_ghost_new              ( ghost, blk_max, VTR_MAX, ctx->seed )                                          );
+  ctx->hfork                  = fd_hfork_join              ( fd_hfork_new              ( hfork, PER_VTR_MAX, VTR_MAX, ctx->seed )                                      );
+  ctx->votes                  = fd_votes_join              ( fd_votes_new              ( votes, slot_max, VTR_MAX, ctx->seed )                                         );
+  ctx->tower                  = fd_tower_join              ( fd_tower_new              ( tower, slot_max, VTR_MAX, ctx->seed )                                         );
+  ctx->scratch_votes          = fd_tower_vote_join         ( fd_tower_vote_new         ( scratch_votes )                                                               );
+  ctx->publishes              = publishes_join             ( publishes_new             ( publishes, pub_max )                                                          );
+  ctx->mleaders               = fd_multi_epoch_leaders_join( fd_multi_epoch_leaders_new( mleaders )                                                                    );
+  ctx->curr_epoch_voters_pool = epoch_voter_pool_join      ( epoch_voter_pool_new      ( curr_epoch_voters_pool, fd_ulong_pow2_up( VTR_MAX ) )                         );
+  ctx->curr_epoch_voters_map  = epoch_voter_map_join       ( epoch_voter_map_new       ( curr_epoch_voters_map,  epoch_voter_map_chain_cnt_est( VTR_MAX ), ctx->seed ) );
+  ctx->next_epoch_voters_pool = epoch_voter_pool_join      ( epoch_voter_pool_new      ( next_epoch_voters_pool, fd_ulong_pow2_up( VTR_MAX ) )                         );
+  ctx->next_epoch_voters_map  = epoch_voter_map_join       ( epoch_voter_map_new       ( next_epoch_voters_map,  epoch_voter_map_chain_cnt_est( VTR_MAX ), ctx->seed ) );
   FD_TEST( ctx->eqvoc );
   FD_TEST( ctx->ghost );
   FD_TEST( ctx->hfork );
@@ -1282,6 +1416,10 @@ init_choreo( void * scratch,
   FD_TEST( ctx->scratch_votes );
   FD_TEST( ctx->publishes );
   FD_TEST( ctx->mleaders );
+  FD_TEST( ctx->curr_epoch_voters_pool );
+  FD_TEST( ctx->curr_epoch_voters_map  );
+  FD_TEST( ctx->next_epoch_voters_pool );
+  FD_TEST( ctx->next_epoch_voters_map  );
 
   memset( ctx->our_vote_acc,              0, sizeof(ctx->our_vote_acc)             );
   ctx->our_vote_acct_sz = 0;
@@ -1294,11 +1432,11 @@ init_choreo( void * scratch,
   memset( &ctx->compact_tower_sync_serde, 0, sizeof(ctx->compact_tower_sync_serde) );
   memset( ctx->vote_txn,                  0, sizeof(ctx->vote_txn)                 );
 
-  ctx->halt_signing    = 0;
-  ctx->hard_fork_fatal = 0;
-  ctx->wait_for_supermajority             = 0;
-  ctx->shred_version   = 0;
-  ctx->init            = 0;
+  ctx->halt_signing           = 0;
+  ctx->hard_fork_fatal        = 0;
+  ctx->init                   = 0;
+  ctx->shred_version          = 0;
+  ctx->wait_for_supermajority = 0;
 
   memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
 
@@ -1329,6 +1467,12 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_tower_vote_align(),    fd_tower_vote_footprint()                                     );
   l = FD_LAYOUT_APPEND( l, publishes_align(),        publishes_footprint( pub_max )                                );
   l = FD_LAYOUT_APPEND( l, fd_multi_epoch_leaders_align(), fd_multi_epoch_leaders_footprint()                       );
+  ulong ev_pool_max  = fd_ulong_pow2_up( VTR_MAX );
+  ulong ev_chain_cnt = epoch_voter_map_chain_cnt_est( VTR_MAX );
+  for( ulong i = 0; i < 2; i++ ) {
+    l = FD_LAYOUT_APPEND( l, epoch_voter_pool_align(), epoch_voter_pool_footprint( ev_pool_max ) );
+    l = FD_LAYOUT_APPEND( l, epoch_voter_map_align(),  epoch_voter_map_footprint ( ev_chain_cnt ) );
+  }
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
