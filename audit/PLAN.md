@@ -111,36 +111,12 @@ First checks:
 - bank lifetime transitions around `cancel`
 - v1 versus v2 tombstone and release paths
 
-### 4. Ingress Trusted-After-Verify Fail-Stops
+### 4. Replay Prune, Minority-Fork, And Bank-Lifetime Edge Cases
 
 Status:
 - `active`
 
 Why this is fourth:
-- shortest path to a realistic cluster-wide liveness PoC
-- many paths rely on “already validated earlier” assumptions
-- good source of invariant gaps that can later escalate into stronger classes
-
-Target files:
-- `src/disco/dedup/fd_dedup_tile.c`
-- `src/disco/verify/fd_verify_tile.c`
-- `src/discoh/resolh/fd_resolh_tile.c`
-- `src/disco/quic/fd_tpu_reasm.c`
-
-Proof goal:
-- prove or falsify that one protocol-reachable input can survive an earlier stage and deterministically hit a later fail-stop assumption across Firedancer validators
-
-First checks:
-- dedup gossip-vote parse-after-sigverify path
-- verify or resolh producer/consumer contract assumptions
-- reachable `FD_LOG_ERR` or `FD_LOG_CRIT` sites whose operands still derive from remote input
-
-### 5. Replay Prune, Minority-Fork, And Bank-Lifetime Edge Cases
-
-Status:
-- `active`
-
-Why this is fifth:
 - recent fixes cluster here
 - good bridge between local lifetime bugs and validator-level impact
 - can plausibly become either liveness or consensus drift
@@ -160,12 +136,12 @@ First checks:
 - `subtree_prune`
 - bank refcount release timing versus `fd_accdb_cancel`
 
-### 6. Tower / Ghost Consensus Edge Cases
+### 5. Tower / Ghost Consensus Edge Cases
 
 Status:
 - `active`
 
-Why this is sixth:
+Why this is fifth:
 - directly maps to consensus Highs
 - recent fixes indicate unfinished edge conditions are plausible
 - lower immediate ROI than the top replay and ALUT lanes, but still strong
@@ -185,12 +161,12 @@ First checks:
 - initialization paths
 - invalid-ancestor and switch-support assumptions
 
-### 7. VM / CPI Pointer Translation And Direct-Mapping Mismatches
+### 6. VM / CPI Pointer Translation And Direct-Mapping Mismatches
 
 Status:
 - `active`
 
-Why this is seventh:
+Why this is sixth:
 - recent fixes touched real safety boundaries
 - can still produce strong execution or liveness findings
 - lower priority than current consensus and accdb lanes
@@ -209,7 +185,7 @@ First checks:
 - account-info pointer restrictions
 - partial-failure rollback behavior
 
-### 8. Sandbox On Broader-I/O Tiles
+### 7. Sandbox On Broader-I/O Tiles
 
 Status:
 - `deprioritized but live`
@@ -226,7 +202,7 @@ Target files:
 Proof goal:
 - find a real privilege-boundary escape, not tile-to-tile influence
 
-### 9. Execle / Execrp As Secondary Sinks
+### 8. Execle / Execrp As Secondary Sinks
 
 Status:
 - `deprioritized until a producer bug is found`
@@ -244,6 +220,11 @@ Proof goal:
 
 ## Current Deprioritized Or Conditional Lanes
 
+- ingress trusted-after-verify fail-stops in `dedup` / `verify` / `resolh` / `tpu_reasm` are mostly exhausted for the `firedancer` binary:
+  - `gossip_dedup` is dead in `src/app/firedancer/topology.c`
+  - downstream `payload_sz` / `txn_t_sz` fail-stops are redundant after verify parse success
+  - `tpu_reasm` fatal sites are internal dcache or chunk-mapping sentinels
+  - only revisit this lane if a new producer-contract mismatch or topology-specific path appears
 - static `pack` unwritable-table drift without a concrete acceptance or rejection mismatch
 - stateless/core-BPF migration drift until the relevant feature path is shown active and in-scope
 - restore or repair unless tied to consensus or cluster-wide impact

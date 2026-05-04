@@ -196,13 +196,16 @@ Files:
 
 Notes:
 - `note`: for this class, the right target is not “any crash” but a remote input that drives the whole Firedancer population into the same fail-stop path.
-- `hypothesis`: there may be parser-to-invariant chains where a valid-looking hostile input reaches a later `FD_LOG_ERR`, `FD_LOG_CRIT`, or impossible-state assumption.
-- `hypothesis`: resource-count or state-machine assumptions in ingress may still be treated as “already checked earlier” and thus be exploitable as cluster-wide liveness sinks.
-- `hypothesis`: the best current concrete ingress anchor is the dedup gossip-vote path where parse failure is treated as impossible after prior sigverify.
-- `note`: some obvious anchors in this lane are weaker than they first appear. `resolh` unknown-kind or unknown-sig errors and `tpu_reasm` invalid-base checks currently look more like internal link-integrity or allocator sentinels than direct remote High targets.
-- `note`: `verify` and `resolh` chunk or payload size checks are still worth tracing, but they currently look more like producer-contract assertions than first-choice remote PoC targets.
-- `todo`: start the easy-first pass with `dedup`, then `verify`, then `resolh`, then `quic/reasm`, and keep only candidates that have a real remote path rather than an internal-metadata corruption prerequisite.
-- `todo`: trace malformed-but-reachable input from ingress parsers into fail-stop macros, allocation assumptions, and impossible-state branches.
+- `note`: do not treat the whole lane as leader-only. In `firedancer`, `verify` consumes `gossip_out`, so gossip-driven ingress checks run on all validators.
+- `note`: `fd_verify_tile.c:49-51` does not reject all gossip votes. It only skips non-vote tags or vote fragments assigned to a different round-robin index. Assigned vote-tag fragments are processed.
+- `falsified`: the strongest original anchor, `fd_dedup_tile.c:188`, is dead in the `firedancer` binary. `src/app/firedancer/topology.c` has no `gossip_dedup` link, so dedup never receives `IN_KIND_GOSSIP`. The live path is `gossip_out -> verify -> verify_dedup -> dedup`, and gossip votes reach dedup as `IN_KIND_VERIFY`.
+- `note`: verify soft-drops both parse failure and signature failure before publish. On the live `verify_dedup` path, dedup and resolh only see transactions that already passed `fd_txn_parse` and `fd_txn_verify`.
+- `note`: `fd_txn_parse_core` enforces `payload_sz <= FD_TXN_MTU`, and the `fd_txn_parse` wrapper with `payload_sz_opt == NULL` enforces full-payload consumption. This makes downstream `payload_sz` and `txn_t_sz` fail-stops in dedup and resolh producer-contract sentinels on the verify path.
+- `falsified`: resolh `unknown in kind`, `unknown sig`, and chunk-range fail-stops are internal link-kind, bank-signal, or producer-metadata sentinels, not remotely reachable protocol fail-stops under the contest attacker model.
+- `falsified`: `fd_tpu_reasm.c:248` and `:343` are dcache-base or chunk-mapping sentinels. Reaching them requires internal corruption or misconfiguration, not hostile QUIC fragmentation alone.
+- `note`: there is a latent `FD_TPU_REASM_MTU > FD_TPU_MTU` mismatch, but the current remote path is blocked by UDP size drops and QUIC flow control (`initial_rx_max_stream_data = FD_TXN_MTU`).
+- `note`: the `dedup` bundle crash on `bundle_idx > 4` is currently guarded by the bundle-client `<= 5` transaction cap, QUIC zeroing of `bundle_id`, and the fact that bundles are optional.
+- `todo`: if this lane is revisited, pivot to new producer-contract mismatches or follower-wide `shred` / `store` / replay paths instead of repeating the same `dedup` / `verify` / `resolh` / `tpu_reasm` anchors.
 
 ## Stakes / Votes / Slot History
 
