@@ -7,6 +7,12 @@ description: Audit Firedancer v1 with Immunefi contest constraints. Use when rev
 
 Use this skill for the Firedancer v1 Immunefi audit competition.
 
+If present, read these first:
+- `audit/SCOPE.md`
+- `audit/PLAN.md`
+- `audit/NOTES.md`
+- `audit/ARCHITECTURE.md`
+
 ## Scope Gates
 
 Audit only code reachable from the `firedancer` binary.
@@ -47,8 +53,8 @@ Do not rely on:
 
 Prioritize bugs that map cleanly to contest impacts:
 - Critical: loss of funds, forged or invalid signatures, runtime conformance leading to loss of funds, infinite mint, key exfiltration
-- High: cluster-wide consensus fork, sandbox escape, accounts DB corruption enabling delayed loss of funds, arbitrary write in `execle` or `execrp`, cluster-wide liveness failure
-- Medium: invalid block production, skipped leader slot, remotely triggerable leader crash or liveness loss
+- High: cluster-wide consensus fork, sandbox escape, accounts DB corruption enabling delayed loss of funds, arbitrary write in `execle` or `execrp`
+- Medium: invalid block production, skipped leader slot, remotely triggerable leader crash or cluster-wide liveness loss
 - Low: narrower liveness issues such as exposed RPC or snapshot-boot windows
 
 ## Audit Order
@@ -102,11 +108,36 @@ For each candidate, recover:
 
 Prefer evidence chains over suspicion lists.
 
+## Use Firedancer-Stateq MCP
+
+Use the `firedancer-stateq` MCP early to narrow ownership, lifecycle, and event-flow questions before doing broad source reads.
+
+Best uses:
+- `query_field`: who writes, guards, and reads one field or expression
+- `query_writepath`: likely writer order for one piece of state
+- `query_function_file`: overloaded callbacks like `after_frag`, `after_credit`, `during_frag`
+- `find_event` and `trace_event`: who publishes a signal and what happens next
+- `find_consumer` and `find_payload`: which tiles consume an event or carry a payload struct
+- `find_state`: which events mutate one shared state object
+- `query_tile_lifecycle`, `query_outstanding_domain`, `query_forest_transition`: tile lifecycle, in-flight work, and forest-style state transitions
+
+Use it for:
+- `bank_idx`, `root_idx`, `published_root_slot`, `ctx->xid`, `ctx->root_bank`
+- replay scheduler ownership and prune timing
+- accdb lineage and txn-slot lifetime questions
+- event chains crossing `verify`, `dedup`, `resolh`, `replay`, `tower`, `poh`, `shred`
+
+Do not treat MCP output as proof by itself.
+- Use it to narrow the search surface and form hypotheses
+- Then confirm the exact guard, sink, and attacker path in source
+- If MCP and source disagree, trust the source and record the mismatch
+
 ## Firedancer-Specific Heuristics
 
 - Shared memory is a first-class attack surface. Trace ownership, lifetimes, and publication order across tiles and client-server boundaries.
 - Treat workspace allocators, scratch regions, and ring buffers as corruption hotspots.
 - For conformance bugs, compare behavior against Agave semantics, not just local assertions.
+- For event-heavy bugs, map the publisher, payload, consumer, and follow-up events before reading every tile in full.
 - Feature-gated code is only bounty-relevant when the gate is active on mainnet or present in `src/flamenco/features/feature_map.json`.
 - Snapshot, repair, gossip, and shred paths can stage bad state that detonates later in replay or runtime. Follow the delayed path.
 - Sandbox findings need a real isolation break, not mere tile-to-tile reachability.
