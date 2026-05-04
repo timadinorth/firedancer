@@ -1,13 +1,39 @@
 # Firedancer Audit Notes
 
-Working notebook for subsystem-by-subsystem notes.
+This file is the durable audit memory.
+
+Use it for:
+- subsystem facts that help future reviewers build context faster
+- results that should not be rediscovered from scratch
+- dead ends and why they failed
+- constraints, trust boundaries, or invariants that change how a path should be audited
+- partial findings that are not strong enough yet for `audit/PLAN.md`, but are still worth preserving
+
+Do not use it for:
+- the ranked next-task queue
+- temporary assignment text
+- broad prioritization debates
+
+The rule of thumb is simple:
+- if another agent would waste time without knowing it, record it here
+- if the information only matters for deciding what to do next, it belongs in `audit/PLAN.md`
 
 Use these status tags:
-- `finding`: evidence-backed bug or strong candidate
-- `hypothesis`: plausible lead that still needs a reachability chain
-- `falsified`: investigated and not currently a contest-grade issue
-- `todo`: follow-up work worth revisiting
-- `note`: context or invariant worth remembering
+- `finding`: evidence-backed bug, or a bug class with a strong enough local proof that it should shape future work
+- `hypothesis`: plausible lead that still needs a reachability chain, semantic comparison, or PoC
+- `falsified`: investigated path that currently does not look contest-grade; record the reason so nobody repeats the same work blindly
+- `todo`: narrow follow-up work that should be resumed later
+- `note`: durable context, invariants, or architectural facts that influence audit reasoning
+
+When recording a `falsified` item, prefer the form:
+- what was suspected
+- what was checked
+- why it currently looks weak or blocked
+
+When recording a `hypothesis`, prefer the form:
+- exact target path
+- what state transition or trust assumption might fail
+- what proof would upgrade it
 
 ## High Rubric
 
@@ -95,7 +121,9 @@ Notes:
 - `hypothesis`: stale or recycled `bank_idx` is the most plausible bridge from local accdb lifetime bugs to validator-level corruption or crash.
 - `hypothesis`: minority-fork prune, root notify, and in-flight work accounting may still have an edge case around stale bank visibility.
 - `hypothesis`: replay scheduling may still need an explicit dependency on the lookup-table account itself, not just the resolved ALT addresses, when an earlier transaction mutates the LUT and a later transaction reads through it.
+- `hypothesis`: replay scheduler currently resolves V0 LUTs against `alut_ctx->{xid=root, els=published_root_slot}` before execution, while runtime execution resolves against `{ bank->slot, bank->idx }`. A later transaction in the same block may therefore see stale LUT contents or stale activation state if an earlier transaction mutates the LUT or if root publication lags the executing bank horizon.
 - `note`: this remains unproven. The current code clearly adds edges for immediate accounts and resolved ALT addresses, but the lookup-table account dependency itself still needs an explicit end-to-end check.
+- `note`: the replay fast path only marks a transaction `serializing` when ALT resolution fails; successful ALT resolution still feeds resolved addresses into the scheduler graph without an obvious dependency on the LUT account itself.
 - `todo`: audit `fd_sched_root_notify`, `subtree_abandon`, `subtree_is_prunable`, and `subtree_prune` against replay refcount drops and accdb cancel timing.
 - `todo`: trace every producer and consumer of `bank_idx` that crosses tile or task boundaries.
 
@@ -114,11 +142,15 @@ Notes:
 - `hypothesis`: pack, bank, and runtime may each believe an earlier stage already enforced an invariant, leaving a conformance gap only visible end-to-end.
 - `hypothesis`: ALT temporal semantics in `fd_alut_status` and `fd_alut_active_addresses_len` are one of the best concrete semantic-drift targets.
 - `note`: the highest-value ALT edge cases are `deactivation_slot == current_slot`, deactivation-slot presence in `SlotHashes`, `current_slot == last_extended_slot`, and `last_extended_slot_start_index` boundaries.
+- `hypothesis`: `fd_bank_abi_resolve_address_lookup_tables` and runtime ALUT loading do not implement the same deactivation rule. Bank ABI uses the coarse `deactivation_slot+512 < slot` heuristic, while runtime checks actual `SlotHashes` membership. This is an explicit split-semantics surface near skipped-slot boundaries.
+- `hypothesis`: leader-side bank execution may still have the stale-ALT class that runtime bundle execution already regressed on. `fd_bank_abi_txn_init` bakes loaded ALT addresses into sidecar memory before Rust execution sees the transaction, but it resolves from the current bank state only and has no `prev_txn_outs`-style forwarded-state hook for earlier same-block or same-bundle LUT mutations.
 - `hypothesis`: stateless-to-core-BPF migration drift is still live but conditional on the relevant migration feature path being active and in scope.
 - `note`: local `fd_builtin_programs.c` currently carries both Feature and Slashing stateless-to-core-BPF configs, so any claimed Agave mismatch needs explicit target-version verification before escalation.
+- `note`: no bank-ABI-side regression test was found for same-block or same-bundle LUT mutation followed by later LUT use, even though runtime has a bundle ALT stale-read regression test.
 - `note`: pack unwritable and builtin-classification differentials are currently deprioritized until a real acceptance or rejection mismatch is shown.
 - `todo`: audit places that locally encode Solana semantics instead of simply consuming already-finalized state.
 - `todo`: compare legacy and v0 transaction handling around packing, runtime checks, and bank application.
+- `todo`: build a same-block and same-bundle ALT-mutation PoC against the bank ABI / bank tile path, not just the runtime bundle path.
 
 ## Tower / Ghost / Consensus
 
@@ -222,5 +254,6 @@ Notes:
 - `hypothesis`: a stale `bank_idx` bug can present as either liveness failure through `FD_TEST` or silent corruption through wrong-bank account commits.
 - `hypothesis`: ALT temporal semantics in `fd_alut_status` and `fd_alut_active_addresses_len` are now one of the highest-value semantic-drift targets.
 - `hypothesis`: replay scheduling may still need an explicit dependency on the lookup-table account itself, not just the resolved ALT addresses, when a prior transaction mutates the LUT and a later transaction reads through it.
+- `hypothesis`: there are now two distinct stale-ALT surfaces to compare against the known runtime bundle fix: replay pre-resolution at root horizon, and leader bank-ABI pre-resolution into sidecar state.
 - `note`: the existing bundle ALT regression in `test_bundle_exec.c` is a same-bundle forwarded-state problem; it does not by itself prove the replay-scheduler LUT-account dependency issue.
 - `hypothesis`: stateless-to-core-BPF migration drift is still live but conditional. It only matters if the relevant migration feature path is active and in scope for the contest target.
